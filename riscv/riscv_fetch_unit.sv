@@ -1,0 +1,392 @@
+// Copyright 2017 ETH Zurich and University of Bologna.
+// Copyright and related rights are licensed under the Solderpad Hardware
+// License, Version 0.51 (the “License”); you may not use this file except in
+// compliance with the License.  You may obtain a copy of the License at
+// http://solderpad.org/licenses/SHL-0.51. Unless required by applicable law
+// or agreed to in writing, software, hardware and materials distributed under
+// this License is distributed on an “AS IS” BASIS, WITHOUT WARRANTIES OR
+// CONDITIONS OF ANY KIND, either express or implied. See the License for the
+// specific language governing permissions and limitations under the License.
+
+////////////////////////////////////////////////////////////////////////////////
+// Engineer:       Andreas Traber - atraber@iis.ee.ethz.ch                    //
+//                                                                            //
+// Design Name:    Prefetcher Buffer for 32 bit memory interface              //
+// Project Name:   RI5CY                                                      //
+// Language:       SystemVerilog                                              //
+//                                                                            //
+// Description:    Prefetch Buffer that caches instructions. This cuts overly //
+//                 long critical paths to the instruction cache               //
+//                                                                            //
+////////////////////////////////////////////////////////////////////////////////
+
+// input port: send address one cycle before the data
+// clear_i clears the FIFO for the following cycle. in_addr_i can be sent in
+// this cycle already
+//import riscv_defines::THREAD_ADDR_WIDTH;
+//import riscv_defines::NUM_THREADS;
+import riscv_defines::*;
+`timescale 1ps / 1ps
+module riscv_fetch
+(
+  input  logic        clk,
+  input  logic        rst_n,
+
+  input  logic        req_i,
+
+  input  logic        pc_set_if_i,
+  input  logic [31:0] addr_i,
+
+  input  logic        pc_set_id_i,
+  input  logic [31:0] jump_addr_i,
+
+  input  logic        pc_set_ex_i,
+  input  logic [31:0] branch_addr_i,
+
+  input  logic        hwloop_i,
+  input  logic [31:0] hwloop_target_i,
+  output logic        hwlp_branch_o,
+
+  input  logic        ready_i,
+  output logic        valid_o,
+  output logic [31:0] rdata_o,
+  output logic [31:0] addr_o,
+  output logic        is_hwlp_o, // is set when the currently served data is from a hwloop
+
+  // goes to instruction memory / instruction cache
+  output logic        instr_req_o,
+  input  logic        instr_gnt_i,
+  output logic [31:0] instr_addr_o,
+  input  logic [31:0] instr_rdata_i,
+  input  logic        instr_rvalid_i,
+
+  // Prefetch Buffer Status
+  output logic        busy_o,
+  input  logic [THREAD_ADDR_WIDTH-1:0] hart_fetch_i,
+  input  logic [THREAD_ADDR_WIDTH-1:0] hart_id_IF_i,
+  input  logic [THREAD_ADDR_WIDTH-1:0] hart_id_ID_i,
+  input  logic [THREAD_ADDR_WIDTH-1:0] hart_id_EX_i,
+  input  logic        is_boot,
+  input  logic        halt_if_i
+);
+
+  enum logic [1:0] {IDLE, WAIT_GNT, WAIT_RVALID, WAIT_ABORTED } CS, NS;
+  enum logic [2:0] {HWLP_NONE, HWLP_IN, HWLP_FETCHING, HWLP_DONE, HWLP_UNALIGNED_COMPRESSED } hwlp_CS, hwlp_NS;
+
+  logic [31:0] thread_pc    [NUM_THREADS-1:0]; // was 1D 'instr_addr_q'
+  logic [31:0] thread_rdata [NUM_THREADS-1:0]; // was in FIFO queue.
+  logic [31:0] fetch_addr;
+  logic        fetch_is_hwlp;
+  logic        addr_valid;
+
+  logic        valid_stored;
+  logic        hwlp_masked, hwlp_branch, hwloop_speculative;
+  logic        unaligned_is_compressed;
+
+  logic [NUM_THREADS-1:0] hart_fetch_enable;
+  logic instr_req;
+
+
+  //////////////////////////////////////////////////////////////////////////////
+  // fetch addr
+  //////////////////////////////////////////////////////////////////////////////
+  assign addr_o        = thread_pc[hart_id_IF_i];
+
+  assign fetch_addr    = {thread_pc[hart_fetch_i][31:2], 2'b00} + ((hart_fetch_enable[hart_fetch_i]) ? 32'd4 : 32'd0);
+
+  assign jump_now      = pc_set_id_i & (hart_id_ID_i == hart_id_IF_i);
+  assign branch_now    = pc_set_ex_i & (hart_id_EX_i == hart_id_IF_i);
+
+  assign hwlp_branch_o = hwlp_branch;
+
+  assign instr_req_o   = halt_if_i ? 1'b0 : instr_req;
+
+  always_comb
+  begin
+    hwlp_NS            = hwlp_CS;
+    hwlp_branch        = 1'b0;
+    hwloop_speculative = 1'b0;
+    hwlp_masked        = 1'b0;
+
+    unique case (hwlp_CS)
+      HWLP_NONE: begin
+        if (hwloop_i) begin
+          hwlp_masked = ~thread_pc[hart_id_IF_i][1];;
+
+          if(valid_o & unaligned_is_compressed & thread_pc[hart_id_IF_i][1]) begin
+              /* We did not jump (hwlp_masked) because
+                 as the instruction was unaligned, so we have to finish
+                 the fetch of the second part
+                 We did not jump but once the instruction came back from the iMem,
+                 we was that it is compressed, therefore we could jump.
+                 The pc_if contains the HWLoop final address (hwloop_i)
+                 and because we did not jump, the pc_if will be pc_if+4 and not the target of the HWloop.
+                 At the next cycle, do a jump to the HWloop target. We will use a "strong" jump signal as the pc_set_if_i one
+                 as we need to invalidate the IF instruction
+               */
+               hwlp_NS            = HWLP_UNALIGNED_COMPRESSED;
+               hwloop_speculative = 1'b1;
+          end else begin
+              if (fetch_is_hwlp)
+                hwlp_NS = HWLP_FETCHING;
+              else
+                hwlp_NS = HWLP_IN;
+          end
+
+        end
+        else begin
+          hwlp_masked = 1'b0;
+        end
+      end
+
+      HWLP_UNALIGNED_COMPRESSED: begin
+        hwlp_branch  = 1'b1;
+        hwlp_NS      = HWLP_FETCHING;
+      end
+
+
+      HWLP_IN: begin
+        hwlp_masked = 1'b1;
+
+        if (fetch_is_hwlp)
+          hwlp_NS = HWLP_FETCHING;
+      end
+
+      // just waiting for rvalid really
+      HWLP_FETCHING: begin
+        hwlp_masked = 1'b0;
+
+
+        if (instr_rvalid_i & (CS != WAIT_ABORTED)) begin
+          if (valid_o & is_hwlp_o)
+            hwlp_NS = HWLP_NONE;
+          else
+            hwlp_NS = HWLP_DONE;
+        end
+      end
+
+      HWLP_DONE: begin
+        hwlp_masked = 1'b0;
+
+        if (valid_o & is_hwlp_o)
+          hwlp_NS = HWLP_NONE;
+      end
+
+      default: begin
+        hwlp_masked = 1'b0;
+
+        hwlp_NS = HWLP_NONE;
+      end
+    endcase
+
+    if (jump_now) begin
+      hwlp_NS    = HWLP_NONE;
+      $display("[%0t] JUMP NOW IN PFB",$time);
+      $stop();
+      //fifo_clear = 1'b1;
+    end
+  end
+
+  //////////////////////////////////////////////////////////////////////////////
+  // instruction fetch FSM
+  // deals with instruction memory / instruction cache
+  //////////////////////////////////////////////////////////////////////////////
+
+  always_comb
+  begin
+    instr_req     = 1'b0;
+    instr_addr_o  = fetch_addr;
+    addr_valid    = 1'b0;
+    fetch_is_hwlp = 1'b0;
+    NS            = CS;
+
+    unique case(CS)
+      // default state, not waiting for requested data
+      IDLE:
+      begin
+        instr_addr_o = fetch_addr;
+        instr_req  = 1'b0;
+        // Don't switch when in a hwlp
+        if(is_boot)
+          instr_addr_o = addr_i;
+        else if (pc_set_if_i | hwlp_branch)
+          instr_addr_o = pc_set_if_i ? addr_i : thread_pc[hart_id_IF_i];
+        else if(hwlp_masked & valid_stored)
+          instr_addr_o = hwloop_target_i;
+
+        if (req_i & (jump_now | branch_now | hwlp_branch | (hwlp_masked & valid_stored))) begin
+          instr_req = 1'b1;
+          addr_valid  = 1'b1;
+
+          if (hwlp_masked & valid_stored) begin
+            fetch_is_hwlp = 1'b1;
+          end
+
+          if(instr_gnt_i) //~>  granted request
+            NS = WAIT_RVALID;
+          else begin //~> got a request but no grant
+            NS = WAIT_GNT;
+          end
+        end
+      end // case: IDLE
+
+      // we sent a request but did not yet get a grant
+      WAIT_GNT:
+      begin
+        instr_addr_o = fetch_addr;
+        instr_req  = 1'b1;
+
+        if (jump_now | hwlp_branch) begin
+          instr_addr_o = jump_now ? addr_i : thread_pc[hart_id_IF_i];
+          addr_valid   = 1'b1;
+        end else if (hwlp_masked & valid_stored) begin
+          instr_addr_o  = hwloop_target_i;
+          addr_valid    = 1'b1;
+          fetch_is_hwlp = 1'b1;
+        end
+
+        if(instr_gnt_i)
+          NS = WAIT_RVALID;
+        else
+          NS = WAIT_GNT;
+      end // case: WAIT_GNT
+
+      // we wait for rvalid, after that we are ready to serve a new request
+      WAIT_RVALID: begin
+        instr_addr_o = fetch_addr;
+
+        if (jump_now | hwlp_branch)
+          instr_addr_o = jump_now ? addr_i : thread_pc[hart_id_IF_i];
+        else if (hwlp_masked)
+          instr_addr_o  = hwloop_target_i;
+
+        if (req_i & (jump_now | branch_now | hwlp_branch | hwlp_masked)) begin
+          // prepare for next request
+
+          if (instr_rvalid_i) begin
+            instr_req = 1'b1;
+            addr_valid  = 1'b1;
+            
+            if (hwlp_masked) begin
+              fetch_is_hwlp = 1'b1;
+            end
+
+            if (instr_gnt_i) begin
+              NS = WAIT_RVALID;
+            end else begin
+              NS = WAIT_GNT;
+            end
+          end else begin
+            // we are requested to abort our current request
+            // we didn't get an rvalid yet, so wait for it
+            // ... reschedule ...
+            if (jump_now | hwlp_branch) begin
+              addr_valid = 1'b1;
+              NS         = WAIT_ABORTED;
+            end else if (hwlp_masked & valid_o) begin
+              addr_valid    = 1'b1;
+              fetch_is_hwlp = 1'b1;
+              NS            = WAIT_ABORTED;
+            end
+          end
+        end else begin
+          // just wait for rvalid and go back to IDLE, no new request
+
+          if (instr_rvalid_i) begin
+            $display("\n[%0t] \n\tPFB CATCH\n[%0t]\n",$time,$time);
+            NS         = IDLE;
+          end
+        end
+      end // case: WAIT_RVALID
+
+      // our last request was aborted, but we didn't yet get a rvalid and
+      // there was no new request sent yet
+      // we assume that req_i is set to high
+      WAIT_ABORTED: begin
+        //instr_addr_o = thread_pc[hart_fetch_i];
+
+        if (jump_now | hwlp_branch) begin
+          instr_addr_o = jump_now ? addr_i : thread_pc[hart_id_IF_i];
+          addr_valid   = 1'b1;
+        end
+
+        if (instr_rvalid_i) begin
+          instr_req  = 1'b1;
+          // no need to send address, already done in WAIT_RVALID
+
+          if (instr_gnt_i) begin
+            NS = WAIT_RVALID;
+          end else begin
+            NS = WAIT_GNT;
+          end
+        end
+      end
+
+      default:
+      begin
+        NS          = IDLE;
+        instr_req = 1'b0;
+      end
+    endcase
+  end
+
+  //////////////////////////////////////////////////////////////////////////////
+  // registers
+  //////////////////////////////////////////////////////////////////////////////
+  logic rdata_set;
+  always_ff @(posedge clk, negedge rst_n)
+  begin
+    if(rst_n == 1'b0)
+    begin
+      CS                <= IDLE;
+      hwlp_CS           <= HWLP_NONE;
+      thread_pc         <= '{default: '0};
+      hart_fetch_enable <= '0;
+    end
+    else
+    begin
+      CS              <= NS;
+      hwlp_CS         <= hwlp_NS;
+      // Re-enable address increment for issued thread
+      hart_fetch_enable[hart_id_IF_i]   <= ~is_boot;
+      // Update fetch PC
+      if (ready_i & addr_valid & ~is_boot) begin
+        if(~hwloop_speculative)
+          thread_pc[hart_fetch_i] <= instr_addr_o;
+        else
+          thread_pc[hart_id_IF_i] <= hwloop_target_i;
+      end
+      if(instr_rvalid_i)
+        thread_rdata[hart_id_IF_i] <= instr_rdata_i;
+      // Boot, Exceptions, Interrupts and System-Calls
+      if(pc_set_if_i) // | irq_if_i
+      begin
+        if(is_boot)
+        begin
+          thread_pc         <= '{default: instr_addr_o};
+          hart_fetch_enable <= '0;
+        end else begin
+          // BALAGAN //
+          $display("[%0t] ######### PC_SET_IF_I ######### \n\tBALAGAN",$time);
+          $stop();
+        end
+      end
+      // Jumps and ID-Exceptions
+      if(pc_set_id_i)
+      begin
+        $display("[%0t] PC_JUMP (ID)  \t:\tthread_pc[%0d] <= 0x%h;",$time,hart_id_ID_i,jump_addr_i);
+        thread_pc[hart_id_ID_i]         <= jump_addr_i;
+        hart_fetch_enable[hart_id_ID_i] <= 1'b0;
+      end
+      // Branches
+      if(pc_set_ex_i)
+      begin
+        $display("[%0t] PC_BRANCH (EX)\t:\tthread_pc[%0d] <= 0x%h;",$time,hart_id_EX_i,branch_addr_i);
+        thread_pc[hart_id_EX_i]         <= branch_addr_i;
+        hart_fetch_enable[hart_id_EX_i] <= 1'b0;
+      end
+      
+    end
+  end
+
+endmodule
